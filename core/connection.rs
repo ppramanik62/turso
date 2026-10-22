@@ -444,6 +444,11 @@ pub struct Connection {
     /// can skip the catalog locks while no such pager can exist.
     pub(super) has_non_main_pagers: AtomicBool,
     pub(super) query_only: AtomicBool,
+    /// True while a READ ONLY transaction is active. Cleared when the
+    /// transaction ends (COMMIT, ROLLBACK, or any implicit rollback).
+    /// Unlike query_only, this is per-transaction: it resets automatically
+    /// when the transaction ends, so it is safe to use for BEGIN READ ONLY.
+    pub(super) tx_read_only: AtomicBool,
     pub(super) vdbe_trace: AtomicBool,
     /// If enabled, the UPDATE/DELETE statements must have a WHERE clause
     pub(super) dml_require_where: AtomicBool,
@@ -3580,6 +3585,16 @@ impl Connection {
         self.bump_prepare_context_generation();
     }
 
+    pub fn is_tx_read_only(&self) -> bool {
+        self.tx_read_only.load(Ordering::Relaxed)
+    }
+
+    pub fn set_tx_read_only(&self, value: bool) {
+        if self.tx_read_only.swap(value, Ordering::Relaxed) != value {
+            self.bump_prepare_context_generation();
+        }
+    }
+
     pub fn set_vdbe_trace(&self, value: bool) {
         self.vdbe_trace.store(value, Ordering::SeqCst);
     }
@@ -4935,6 +4950,7 @@ impl Connection {
         self.rollback_attached_wal_txns();
         self.index_methods_on_transaction_rolled_back();
         self.set_tx_state(TransactionState::None);
+        self.set_tx_read_only(false);
         self.clear_tx_poison();
         // The entire transaction is being rolled back, so every materialized
         // view delta captured within it is void. Leaving them behind would
@@ -4968,6 +4984,7 @@ impl Connection {
             self.index_methods_on_transaction_rolled_back();
             self.set_tx_state(TransactionState::None);
             self.auto_commit.store(true, Ordering::SeqCst);
+            self.set_tx_read_only(false);
         }
 
         self.rollback_temp_schema();
