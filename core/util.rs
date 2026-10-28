@@ -1781,6 +1781,7 @@ where
         | ast::Stmt::DropSequence { .. }
         | ast::Stmt::CreateSchema { .. }
         | ast::Stmt::CreateRole { .. }
+        | ast::Stmt::SetRole { .. }
         | ast::Stmt::DropSchema { .. } => {}
     }
     Ok(())
