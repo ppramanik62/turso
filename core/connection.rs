@@ -190,6 +190,22 @@ impl Drop for SchemaReparseGuard {
     }
 }
 
+/// Settings for preparing a statement that only core sets.
+#[derive(Debug, Default)]
+pub(crate) struct PrepareOptions {
+    /// Whether the statement reads the engine's own metadata to load the
+    /// schema, which no role's privileges limit.
+    pub(crate) reads_engine_metadata: bool,
+}
+
+impl PrepareOptions {
+    pub(crate) fn engine_metadata_read() -> Self {
+        Self {
+            reads_engine_metadata: true,
+        }
+    }
+}
+
 /// Re-entrant state for [`Connection::maybe_reparse_schema_nonblock`].
 #[derive(Default)]
 pub(crate) enum MaybeReparseSchemaState {
@@ -1049,6 +1065,7 @@ impl Connection {
         cmd: Cmd,
         input: &str,
         origin: StatementOrigin,
+        prepare_options: &PrepareOptions,
     ) -> Result<(Program, Arc<Pager>, QueryMode)> {
         self.maybe_update_schema();
 
@@ -1066,6 +1083,7 @@ impl Connection {
             mode,
             input,
             origin,
+            prepare_options,
         ) {
             Ok(program) => Ok((program, pager, mode)),
             Err(err) if self.should_retry_cross_process_schema_lookup(&err)? => {
@@ -1097,6 +1115,7 @@ impl Connection {
                     mode,
                     input,
                     origin,
+                    prepare_options,
                 )
                 .map(|program| (program, pager, mode))
             }
@@ -1127,6 +1146,16 @@ impl Connection {
         self: &Arc<Connection>,
         sql: impl AsRef<str>,
         origin: StatementOrigin,
+    ) -> Result<Statement> {
+        self.prepare_with_origin_and_options(sql, origin, &PrepareOptions::default())
+    }
+
+    #[turso_macros::trace_stack]
+    pub(crate) fn prepare_with_origin_and_options(
+        self: &Arc<Connection>,
+        sql: impl AsRef<str>,
+        origin: StatementOrigin,
+        prepare_options: &PrepareOptions,
     ) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -1160,7 +1189,7 @@ impl Connection {
             let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
+            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, prepare_options)?;
 
             Ok(Statement::new_with_origin(
                 program,
@@ -1169,7 +1198,8 @@ impl Connection {
                 byte_offset_end,
                 origin,
                 needs_nested_guard,
-            ))
+            )
+            .with_reads_engine_metadata(prepare_options.reads_engine_metadata))
         })();
         if result.is_err() && needs_nested_guard {
             self.end_nested();
@@ -1217,7 +1247,8 @@ impl Connection {
             self.start_nested();
         }
         let result = (|| {
-            let (program, pager, mode) = self.compile_cmd(cmd, input, origin)?;
+            let (program, pager, mode) =
+                self.compile_cmd(cmd, input, origin, &PrepareOptions::default())?;
             Ok(Statement::new_with_origin(
                 program,
                 pager,
@@ -1855,7 +1886,12 @@ impl Connection {
             let input = str::from_utf8(&remaining.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
+            let (program, pager, mode) = self.compile_cmd(
+                cmd,
+                input,
+                StatementOrigin::Root,
+                &PrepareOptions::default(),
+            )?;
             Statement::new(program, pager, mode, 0).run_ignore_rows()?;
             remaining = &remaining[byte_offset_end..];
         }
@@ -1877,7 +1913,12 @@ impl Connection {
         let Some(cmd) = cmd else {
             return Ok(None);
         };
-        let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
+        let (program, pager, mode) = self.compile_cmd(
+            cmd,
+            input,
+            StatementOrigin::Root,
+            &PrepareOptions::default(),
+        )?;
         Ok(Some(Statement::new(program, pager, mode, 0)))
     }
 
@@ -1895,7 +1936,12 @@ impl Connection {
             let input = str::from_utf8(&remaining.as_bytes()[..byte_offset_end])
                 .unwrap()
                 .trim();
-            let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
+            let (program, pager, mode) = self.compile_cmd(
+                cmd,
+                input,
+                StatementOrigin::Root,
+                &PrepareOptions::default(),
+            )?;
             {
                 crate::stack::trace_stack!("run");
                 Statement::new(program, pager.clone(), mode, 0).run_ignore_rows()?;
@@ -1920,7 +1966,12 @@ impl Connection {
         let input = str::from_utf8(&sql.as_ref().as_bytes()[..byte_offset_end])
             .unwrap()
             .trim();
-        let (program, pager, mode) = self.compile_cmd(cmd, input, StatementOrigin::Root)?;
+        let (program, pager, mode) = self.compile_cmd(
+            cmd,
+            input,
+            StatementOrigin::Root,
+            &PrepareOptions::default(),
+        )?;
         let stmt = Statement::new(program, pager, mode, 0);
         Ok(Some((stmt, byte_offset_end)))
     }
@@ -4052,12 +4103,18 @@ impl Connection {
         if stmt.is_none() {
             let escaped = backing_table_name.replace('"', "\"\"");
             let sql = format!("SELECT start, inc, min, max, cycle FROM \"{escaped}\" LIMIT 1");
-            let prepared = self.prepare_internal(sql).map_err(|err| {
-                LimboError::Corrupt(format!(
-                    "internal sequence backing table \"{backing_table_name}\" for sequence \
+            let prepared = self
+                .prepare_with_origin_and_options(
+                    sql,
+                    StatementOrigin::InternalHelper,
+                    &PrepareOptions::engine_metadata_read(),
+                )
+                .map_err(|err| {
+                    LimboError::Corrupt(format!(
+                        "internal sequence backing table \"{backing_table_name}\" for sequence \
                      \"{seq_name}\": cannot prepare descriptor SELECT: {err}"
-                ))
-            })?;
+                    ))
+                })?;
             *stmt = Some(Box::new(prepared));
             // Fresh statement → clear any descriptor captured for a prior backing
             // table, so an empty backing table is detected as missing-row
@@ -4133,13 +4190,19 @@ impl Connection {
             let sql = format!(
                 "SELECT value, is_called FROM \"{escaped}\" ORDER BY value {direction} LIMIT 1"
             );
-            let prepared = self.prepare_internal(sql).map_err(|err| {
-                LimboError::Corrupt(format!(
-                    "internal sequence backing table \"{backing_table_name}\" for sequence \
+            let prepared = self
+                .prepare_with_origin_and_options(
+                    sql,
+                    StatementOrigin::InternalHelper,
+                    &PrepareOptions::engine_metadata_read(),
+                )
+                .map_err(|err| {
+                    LimboError::Corrupt(format!(
+                        "internal sequence backing table \"{backing_table_name}\" for sequence \
                      \"{}\": cannot prepare watermark SELECT: {err}",
-                    seq.name
-                ))
-            })?;
+                        seq.name
+                    ))
+                })?;
             *stmt = Some(Box::new(prepared));
             *row = None;
         }
