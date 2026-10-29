@@ -3965,13 +3965,28 @@ impl PostgreSQLTranslator {
             (translated_order, vec![])
         };
 
-        Ok(ast::Expr::FunctionCall {
+        let return_type = auth_function_return_type(&func_name);
+        let call = ast::Expr::FunctionCall {
             name: exact_name(func_name),
             distinctness,
             args,
             order_by,
             within_group,
             filter_over,
+        };
+        // auth.uid() returns text from core, so give it the type PostgreSQL
+        // declares: `user_id = auth.uid()` compares two uuids, and a uuid
+        // column may only be compared with a uuid.
+        Ok(match return_type {
+            Some(type_name) => ast::Expr::Cast {
+                expr: Box::new(call),
+                type_name: Some(ast::Type {
+                    name: type_name.to_string(),
+                    size: None,
+                    array_dimensions: 0,
+                }),
+            },
+            None => call,
         })
     }
 
@@ -7538,6 +7553,13 @@ fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseErro
         });
     }
     Ok(name)
+}
+
+fn auth_function_return_type(func_name: &str) -> Option<&'static str> {
+    match func_name {
+        "auth.uid" => Some("uuid"),
+        _ => None,
+    }
 }
 
 fn unqualified_name(names: &[String], allowed_schema: fn(&str) -> bool) -> Option<&String> {
