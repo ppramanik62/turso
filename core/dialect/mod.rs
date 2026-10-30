@@ -254,6 +254,15 @@ pub trait Dialect: Send + Sync + 'static {
     fn allows_qualified_columns_in_index_terms(&self) -> bool {
         false
     }
+
+    /// Checks a call like `f(*)` to a function that is neither an aggregate
+    /// nor a window function.
+    ///
+    /// SQLite runs `f(*)` as `f()`. PostgreSQL accepts `*` only for
+    /// aggregates and raises an error.
+    fn check_star_call_of_plain_function(&self, _name: &str) -> crate::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
