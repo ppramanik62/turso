@@ -1,6 +1,6 @@
 use super::*;
 use crate::schema::ResolvedType;
-use crate::translate::expr::{column_stored_form, translate_compared_expr};
+use crate::translate::expr::translate_compared_expr;
 use crate::translate::plan::BitSet;
 use crate::vdbe::insn::NullMatchingMask;
 use turso_parser::ast::{self, NullsOrder};
@@ -448,5 +448,11 @@ pub(super) fn index_key_stored_form(
     let Some(table_col) = table.columns().get(idx_col.pos_in_table) else {
         return Ok(None);
     };
-    column_stored_form(&table_col.ty_str, table.is_strict(), resolver.schema())
+    let Some(resolved) = resolver
+        .schema()
+        .resolve_type(&table_col.ty_str, table.is_strict())?
+    else {
+        return Ok(None);
+    };
+    resolved.stored_form()
 }
