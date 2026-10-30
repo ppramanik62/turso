@@ -289,3 +289,21 @@ expect {
     C
 }
 
+
+@cross-check-integrity
+test create-table-and-view-keep-declared-name-in-schema {
+    CREATE TABLE "Pk6" (id INTEGER, u TEXT UNIQUE);
+    CREATE VIEW testView AS SELECT * FROM "Pk6";
+    INSERT INTO PK6 VALUES (1, 'a');
+    SELECT type, name, tbl_name FROM sqlite_schema WHERE type IN ('table', 'view') ORDER BY name;
+    SELECT tbl_name FROM sqlite_schema WHERE type = 'index';
+    SELECT * FROM pk6;
+    SELECT * FROM TESTVIEW;
+}
+expect {
+    table|Pk6|Pk6
+    view|testView|testView
+    Pk6
+    1|a
+    1|a
+}
