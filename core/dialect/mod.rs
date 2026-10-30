@@ -254,6 +254,16 @@ pub trait Dialect: Send + Sync + 'static {
     fn allows_qualified_columns_in_index_terms(&self) -> bool {
         false
     }
+
+    /// The built-in type that both sides of a comparison are cast to when one
+    /// side has built-in type `lhs_type` and the other the different built-in
+    /// type `rhs_type`, both lowercase. None makes the comparison an error.
+    ///
+    /// PostgreSQL casts a `date` to `timestamp` before comparing it with a
+    /// `timestamp`. SQLite has no such casts.
+    fn comparison_type(&self, _lhs_type: &str, _rhs_type: &str) -> Option<&'static str> {
+        None
+    }
 }
 
 #[cfg(test)]
