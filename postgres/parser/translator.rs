@@ -3109,22 +3109,39 @@ impl PostgreSQLTranslator {
                         "a fractional-second precision on CURRENT_TIME/CURRENT_TIMESTAMP/LOCALTIME/LOCALTIMESTAMP",
                     ));
                 }
+                // Each result gets the type PostgreSQL gives it, so that
+                // `ts < current_timestamp` compares two timestamps and
+                // `current_date - 1` is a date. CURRENT_TIME is a time with a
+                // time zone, which tursopg doesn't have, so it stays text.
                 match SqlValueFunctionOp::try_from(svf.op) {
-                    Ok(SqlValueFunctionOp::SvfopCurrentDate) => {
-                        Ok(ast::Expr::Literal(ast::Literal::CurrentDate))
-                    }
+                    Ok(SqlValueFunctionOp::SvfopCurrentDate) => Ok(cast_to(
+                        ast::Expr::Literal(ast::Literal::CurrentDate),
+                        "date",
+                    )),
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentTime
-                        | SqlValueFunctionOp::SvfopCurrentTimeN
-                        | SqlValueFunctionOp::SvfopLocaltime
-                        | SqlValueFunctionOp::SvfopLocaltimeN,
+                        | SqlValueFunctionOp::SvfopCurrentTimeN,
                     ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTime)),
                     Ok(
+                        SqlValueFunctionOp::SvfopLocaltime | SqlValueFunctionOp::SvfopLocaltimeN,
+                    ) => Ok(cast_to(
+                        ast::Expr::Literal(ast::Literal::CurrentTime),
+                        "time",
+                    )),
+                    Ok(
                         SqlValueFunctionOp::SvfopCurrentTimestamp
-                        | SqlValueFunctionOp::SvfopCurrentTimestampN
-                        | SqlValueFunctionOp::SvfopLocaltimestamp
+                        | SqlValueFunctionOp::SvfopCurrentTimestampN,
+                    ) => Ok(cast_to(
+                        ast::Expr::Literal(ast::Literal::CurrentTimestamp),
+                        "timestamptz",
+                    )),
+                    Ok(
+                        SqlValueFunctionOp::SvfopLocaltimestamp
                         | SqlValueFunctionOp::SvfopLocaltimestampN,
-                    ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTimestamp)),
+                    ) => Ok(cast_to(
+                        ast::Expr::Literal(ast::Literal::CurrentTimestamp),
+                        "timestamp",
+                    )),
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentUser
                         | SqlValueFunctionOp::SvfopSessionUser
@@ -3965,7 +3982,7 @@ impl PostgreSQLTranslator {
             (translated_order, vec![])
         };
 
-        let return_type = auth_function_return_type(&func_name);
+        let return_type = function_return_type(&func_name);
         let call = ast::Expr::FunctionCall {
             name: exact_name(func_name),
             distinctness,
@@ -3974,18 +3991,11 @@ impl PostgreSQLTranslator {
             within_group,
             filter_over,
         };
-        // auth.uid() returns text from core, so give it the type PostgreSQL
-        // declares: `user_id = auth.uid()` compares two uuids, and a uuid
-        // column may only be compared with a uuid.
+        // These functions return text from core, so give them the type
+        // PostgreSQL declares: `user_id = auth.uid()` compares two uuids, and
+        // a uuid column may only be compared with a uuid.
         Ok(match return_type {
-            Some(type_name) => ast::Expr::Cast {
-                expr: Box::new(call),
-                type_name: Some(ast::Type {
-                    name: type_name.to_string(),
-                    size: None,
-                    array_dimensions: 0,
-                }),
-            },
+            Some(type_name) => cast_to(call, type_name),
             None => call,
         })
     }
@@ -7555,10 +7565,24 @@ fn function_name(names: &[pg_query::protobuf::Node]) -> Result<String, ParseErro
     Ok(name)
 }
 
-fn auth_function_return_type(func_name: &str) -> Option<&'static str> {
+fn function_return_type(func_name: &str) -> Option<&'static str> {
     match func_name {
         "auth.uid" => Some("uuid"),
+        "now" | "clock_timestamp" | "transaction_timestamp" | "statement_timestamp" => {
+            Some("timestamptz")
+        }
         _ => None,
+    }
+}
+
+fn cast_to(expr: ast::Expr, type_name: &str) -> ast::Expr {
+    ast::Expr::Cast {
+        expr: Box::new(expr),
+        type_name: Some(ast::Type {
+            name: type_name.to_string(),
+            size: None,
+            array_dimensions: 0,
+        }),
     }
 }
 
@@ -9218,8 +9242,11 @@ mod tests {
         };
 
         let expected = [
-            ast::Expr::Literal(ast::Literal::CurrentTimestamp),
-            ast::Expr::Literal(ast::Literal::CurrentDate),
+            cast_to(
+                ast::Expr::Literal(ast::Literal::CurrentTimestamp),
+                "timestamptz",
+            ),
+            cast_to(ast::Expr::Literal(ast::Literal::CurrentDate), "date"),
             ast::Expr::Literal(ast::Literal::CurrentTime),
         ];
 
@@ -9452,7 +9479,15 @@ mod tests {
         if let ast::Stmt::Select(select) = translated {
             if let ast::OneSelect::Select { columns, .. } = &select.body.select {
                 if let ast::ResultColumn::Expr(expr, _) = &columns[0] {
-                    if let ast::Expr::FunctionCall { name, .. } = &**expr {
+                    let ast::Expr::Cast {
+                        expr: call,
+                        type_name: Some(type_name),
+                    } = &**expr
+                    else {
+                        panic!("Expected now() cast to timestamptz");
+                    };
+                    assert_eq!(type_name.name, "timestamptz");
+                    if let ast::Expr::FunctionCall { name, .. } = &**call {
                         assert_eq!(
                             name.as_str(),
                             "now",
